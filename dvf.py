@@ -6,6 +6,7 @@ Predict the price per square metre of housing in Paris and its inner suburbs.
 # IMPORTS
 # =============================================================================
 
+import argparse
 import os
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 import seaborn as sns
+from dotenv import load_dotenv
 from lightgbm import LGBMRegressor
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
@@ -25,9 +27,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OrdinalEncoder
 from skore import EstimatorReport
-import argparse
-from dotenv import load_dotenv
-
 
 # =============================================================================
 # CONFIGURATION
@@ -38,9 +37,9 @@ os.chdir("/home/onyxia/work/application")
 load_dotenv()
 jeton_api = os.environ["JETON_API"]
 
-parser = argparse.ArgumentParser(description="Qui êtes-vous?")
+parser = argparse.ArgumentParser(description="Prédiction du prix au m² (DVF)")
 parser.add_argument(
-    "--n_trees", type=int, default="1500", help="nombre d'arbre du modèle"
+    "--n_trees", type=int, default=1500, help="nombre d'arbres du modèle"
 )
 args = parser.parse_args()
 
@@ -64,7 +63,7 @@ data_location.mkdir(exist_ok=True)
 # =============================================================================
 
 
-def download_sources(adresse, cible):
+def download_sources(adresse: str, cible: Path) -> None:
     """Download the file at `adresse` and write it to `cible`."""
     r = requests.get(adresse, timeout=120)
     r.raise_for_status()
@@ -72,9 +71,74 @@ def download_sources(adresse, cible):
         f.write(r.content)
 
 
-def as_category(df):
+def as_category(df: pd.DataFrame) -> pd.DataFrame:
     """Cast columns to 'category' so that LightGBM treats them as categorical."""
     return df.astype("category")
+
+
+def check_code_commune_formatting(df: pd.DataFrame) -> int:
+    """Return the number of rows whose `code_commune` is not 5 characters long
+    starting with `code_departement`."""
+    con = duckdb.connect(database=":memory:")
+    # DuckDB cannot read the geometry column
+    con.register(
+        "attributs", pd.DataFrame(df[["code_commune", "code_departement"]])
+    )
+    return con.sql("""
+        SELECT COUNT(*)
+        FROM attributs
+        WHERE length(code_commune) <> 5
+        OR NOT starts_with(code_commune, code_departement)
+    """).fetchone()[0]
+
+
+def check_missing_values(df: pd.DataFrame, column: str) -> int:
+    """Return the number of missing values in `column`."""
+    return int(df[column].isna().sum())
+
+
+def check_unseen_categories(
+    df_train: pd.DataFrame, df_test: pd.DataFrame, column: str
+) -> set:
+    """Return the categories of `column` present in test but not in train."""
+    return set(df_test[column].dropna().unique()) - set(
+        df_train[column].dropna().unique()
+    )
+
+
+def get_melodi_indicator(
+    code: str,
+    value_name: str,
+    token: str,
+    dataset: str = "DS_FILOSOFI_CC",
+    dimension: str = "FILOSOFI_MEASURE",
+    time_period: int = 2023,
+    geo_level: tuple[str, ...] = ("COM", "ARM"),
+) -> pd.DataFrame:
+    """Fetch one indicator from the INSEE Melodi API, by municipality.
+
+    Returns a DataFrame with columns `CODGEO` and `value_name`.
+    """
+    response = requests.get(
+        f"https://api.insee.fr/melodi/data/{dataset}",
+        params={
+            "GEO": list(geo_level),
+            dimension: code,
+            "TIME_PERIOD": time_period,
+            "maxResult": 40000,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    return pd.DataFrame(
+        {
+            "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
+            value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
+        }
+        for obs in response.json()["observations"]
+    )
 
 
 # =============================================================================
@@ -99,45 +163,16 @@ dvf = gpd.read_parquet(data_location / "dvf.parquet")
 # 2. DATA QUALITY CHECKS AND FILTERING
 # =============================================================================
 
-con = duckdb.connect(database=":memory:")
-
-# DuckDB cannot read the geometry column
-dvf_attributs = dvf.drop(columns="geometry")
-
-bad = con.sql("""
-    SELECT COUNT(*) AS n_bad
-    FROM dvf_attributs
-    WHERE length(code_commune) <> 5
-    OR NOT starts_with(code_commune, code_departement)
-""").fetchall()[0][0]
-
-if bad == 0:
+n_bad = check_code_commune_formatting(dvf)
+if n_bad == 0:
     print("Test 'code_commune' OK: toujours 5 caractères commençant par le département")
 else:
-    print(f"Problème dans la colonne code_commune: {bad} codes mal formés.")
+    print(f"Problème dans la colonne code_commune: {n_bad} codes mal formés.")
 
-# à faire: generalise to all variables
-n_missing = con.sql("""
-    SELECT COUNT(*) AS n_missing
-    FROM dvf_attributs
-    WHERE valeur_fonciere IS NULL
-""").fetchall()[0][0]
-
-message_ok = "Pas de valeur manquante pour la variable valeur_fonciere"
-message_warn = f"{n_missing} valeurs manquantes pour la variable valeur_fonciere"
-message = message_ok if n_missing == 0 else message_warn
-print(message)
-
-n_missing = con.sql("""
-    SELECT COUNT(*) AS n_missing
-    FROM dvf_attributs
-    WHERE surface_reelle_bati IS NULL
-""").fetchall()[0][0]
-
-message_ok = "Pas de valeur manquante pour la variable surface_reelle_bati"
-message_warn = f"{n_missing} valeurs manquantes pour la variable surface_reelle_bati"
-message = message_ok if n_missing == 0 else message_warn
-print(message)
+for col in dvf.columns:
+    n_missing = check_missing_values(dvf, col)
+    if n_missing > 0:
+        print(f"{n_missing} valeurs manquantes pour la variable {col}")
 
 dvf = dvf.loc[dvf["valeur_fonciere"] < 1e6]
 dvf["annee"] = pd.to_datetime(dvf["date_mutation"]).dt.year
@@ -192,80 +227,18 @@ dvf = dvf.sjoin(filo, how="left", predicate="within")
 
 # 3.2 Municipal Filosofi data (INSEE Melodi API) ------------------------------
 
-# Median standard of living
-
-dataset = "DS_FILOSOFI_CC"
-dimension = "FILOSOFI_MEASURE"
-code = "MED_SL"
-value_name = "NIVVIE_MEDIAN"
-time_period = 2023
-# DVF codes Paris by arrondissement (ARM), not as a single municipality (COM)
-geo_level = ["COM", "ARM"]
-
-url = f"https://api.insee.fr/melodi/data/{dataset}"
-
-params = {
-    "GEO": geo_level,
-    dimension: code,
-    "TIME_PERIOD": time_period,
-    "maxResult": 40000,
-}
-
-headers = {"Authorization": f"Bearer {jeton_api}"}
-
-response = requests.get(url, params=params, headers=headers, timeout=60)
-response.raise_for_status()
-observations = response.json()["observations"]
-
-niveau_vie = pd.DataFrame(
-    {
-        "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
-        value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
-    }
-    for obs in observations
-)
-
-# Poverty rate
-
-dataset = "DS_FILOSOFI_CC"
-dimension = "FILOSOFI_MEASURE"
-code = "PR_MD60"
-value_name = "TAUX_PAUVRETE"
-time_period = 2023
-geo_level = ["COM", "ARM"]
-
-url = f"https://api.insee.fr/melodi/data/{dataset}"
-
-params = {
-    "GEO": geo_level,
-    dimension: code,
-    "TIME_PERIOD": time_period,
-    "maxResult": 40000,
-}
-
-headers = {"Authorization": f"Bearer {jeton_api}"}
-
-response = requests.get(url, params=params, headers=headers, timeout=60)
-response.raise_for_status()
-observations = response.json()["observations"]
-
-taux_pauvrete = pd.DataFrame(
-    {
-        "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
-        value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
-    }
-    for obs in observations
-)
+# DVF codes Paris by arrondissement (ARM), not as a single municipality (COM):
+# get_melodi_indicator requests both levels by default.
+niveau_vie = get_melodi_indicator("MED_SL", "NIVVIE_MEDIAN", jeton_api)
+taux_pauvrete = get_melodi_indicator("PR_MD60", "TAUX_PAUVRETE", jeton_api)
 
 
 # 3.3 Merge with DVF ----------------------------------------------------------
 
-dvf = dvf.merge(niveau_vie, left_on="code_commune", right_on="CODGEO", how="left").drop(
-    columns="CODGEO"
-)
-dvf = dvf.merge(
-    taux_pauvrete, left_on="code_commune", right_on="CODGEO", how="left"
-).drop(columns="CODGEO")
+for indicateur in (niveau_vie, taux_pauvrete):
+    dvf = dvf.merge(
+        indicateur, left_on="code_commune", right_on="CODGEO", how="left"
+    ).drop(columns="CODGEO")
 
 print(dvf.head(5))
 
@@ -428,23 +401,12 @@ X_train, X_test, y_train, y_test = train_test_split(  # pylint: disable=invalid-
 pd.concat([X_train, y_train], axis=1).to_csv("train.csv")
 pd.concat([X_test, y_test], axis=1).to_csv("test.csv")
 
-if set(X_test["code_commune"].dropna().unique()) - set(
-    X_train["code_commune"].dropna().unique()
-):
-    message = "Modalités de code_commune absentes de l'apprentissage"
-else:
-    message = "Toutes les modalités de code_commune du test sont connues du modèle"
-
-print(message)
-
-if set(X_test["type_local"].dropna().unique()) - set(
-    X_train["type_local"].dropna().unique()
-):
-    message = "Modalités de type_local absentes de l'apprentissage"
-else:
-    message = "Toutes les modalités de type_local du test sont connues du modèle"
-
-print(message)
+for col in categorical_features:
+    unseen = check_unseen_categories(X_train, X_test, col)
+    if unseen:
+        print(f"Modalités de {col} absentes de l'apprentissage : {unseen}")
+    else:
+        print(f"Toutes les modalités de {col} du test sont connues du modèle")
 
 
 # =============================================================================
